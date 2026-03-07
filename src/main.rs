@@ -5,8 +5,10 @@ use std::{
 };
 
 use axum::{
-    extract::State,
-    response::Json,
+    extract::{Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::get,
     Router,
 };
@@ -24,6 +26,7 @@ struct AppState {
     networks: Mutex<Networks>,
     /// Tracks previous network bytes for speed calculation
     prev_net: Mutex<NetSnapshot>,
+    api_key: String,
 }
 
 struct NetSnapshot {
@@ -123,6 +126,24 @@ fn uptime_string(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     format!("{}h {}m", h, m)
+}
+
+// ─── Auth Middleware ──────────────────────────────────────────────────────────
+
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    match headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        Some(key) if key == state.api_key => next.run(request).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "missing or invalid API key" })),
+        )
+            .into_response(),
+    }
 }
 
 // ─── Route Handlers ───────────────────────────────────────────────────────────
@@ -359,6 +380,9 @@ async fn main() {
         .compact()
         .init();
 
+    let api_key = std::env::var("MONITOR_API_KEY")
+        .expect("MONITOR_API_KEY env variable must be set");
+
     // Warm up sysinfo — first CPU read is always 0 without a prior sample
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -382,7 +406,22 @@ async fn main() {
             bytes_recv: init_recv,
             taken_at: Instant::now(),
         }),
+        api_key,
     });
+
+    // Print startup banner with local IP
+    let local_ip = get_local_ip();
+    let port = 8080u16;
+
+    println!("\n{}", "=".repeat(52));
+    println!("  Remote System Monitor — Rust Server");
+    println!("{}", "=".repeat(52));
+    println!("  Local URL:   http://localhost:{}", port);
+    println!("  Network URL: http://{}:{}  ← use in Android app", local_ip, port);
+    println!("  API Key:     {}...", &state.api_key[..8.min(state.api_key.len())]);
+    println!("  Header:      X-API-Key: <your-key>");
+    println!("  Optimised for 2s polling over local WiFi");
+    println!("{}\n", "=".repeat(52));
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -397,20 +436,9 @@ async fn main() {
         .route("/metrics/memory", get(get_memory))
         .route("/metrics/disk", get(get_disk))
         .route("/metrics/network", get(get_network))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(cors)
         .with_state(state);
-
-    // Print startup banner with local IP
-    let local_ip = get_local_ip();
-    let port = 8080u16;
-
-    println!("\n{}", "=".repeat(52));
-    println!("  Remote System Monitor — Rust Server");
-    println!("{}", "=".repeat(52));
-    println!("  Local URL:   http://localhost:{}", port);
-    println!("  Network URL: http://{}:{}  ← use in Android app", local_ip, port);
-    println!("  Optimised for 2s polling over local WiFi");
-    println!("{}\n", "=".repeat(52));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Listening on {}", addr);
