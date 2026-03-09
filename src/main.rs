@@ -26,6 +26,8 @@ struct AppState {
     networks: Mutex<Networks>,
     /// Tracks previous network bytes for speed calculation
     prev_net: Mutex<NetSnapshot>,
+    /// NVML handle for NVIDIA GPU monitoring (None if unavailable)
+    nvml: Option<nvml_wrapper::Nvml>,
     api_key: String,
 }
 
@@ -43,6 +45,7 @@ struct MetricsResponse {
     system: SystemInfo,
     cpu: CpuInfo,
     memory: MemoryInfo,
+    gpu: Vec<GpuInfo>,
     disk: Vec<DiskInfo>,
     network: NetworkInfo,
 }
@@ -77,6 +80,21 @@ struct MemoryInfo {
     swap_total_gb: f64,
     swap_used_gb: f64,
     swap_percent: f32,
+}
+
+#[derive(Serialize)]
+struct GpuInfo {
+    index: u32,
+    name: String,
+    vendor: String,
+    temperature_celsius: Option<u32>,
+    utilization_percent: Option<u32>,
+    memory_total_mb: u64,
+    memory_used_mb: u64,
+    memory_usage_percent: f32,
+    fan_speed_percent: Option<u32>,
+    power_draw_watts: Option<f64>,
+    clock_speed_mhz: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -122,6 +140,10 @@ fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
 
+fn round1_f32(v: f32) -> f32 {
+    (v * 10.0).round() / 10.0
+}
+
 fn uptime_string(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
@@ -153,7 +175,7 @@ async fn root() -> Json<serde_json::Value> {
         "status": "ok",
         "message": "Remote System Monitor (Rust) is running",
         "version": "1.0.0",
-        "endpoints": ["/metrics", "/metrics/cpu", "/metrics/memory", "/metrics/disk", "/metrics/network", "/health"]
+        "endpoints": ["/metrics", "/metrics/cpu", "/metrics/memory", "/metrics/gpu", "/metrics/disk", "/metrics/network", "/health"]
     }))
 }
 
@@ -181,6 +203,7 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse
 
     let cpu_info = build_cpu_info(&sys);
     let memory_info = build_memory_info(&sys);
+    let gpu_info = build_gpu_info(&state.nvml);
     let disk_info = build_disk_info(&disks);
     let network_info = build_network_info(&networks, &mut state.prev_net.lock().unwrap());
     let system_info = build_system_info(&sys);
@@ -190,6 +213,7 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse
         system: system_info,
         cpu: cpu_info,
         memory: memory_info,
+        gpu: gpu_info,
         disk: disk_info,
         network: network_info,
     })
@@ -210,6 +234,13 @@ async fn get_memory(State(state): State<Arc<AppState>>) -> Json<serde_json::Valu
     Json(serde_json::json!({
         "timestamp": Local::now().to_rfc3339(),
         "memory": build_memory_info(&sys)
+    }))
+}
+
+async fn get_gpu(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "timestamp": Local::now().to_rfc3339(),
+        "gpu": build_gpu_info(&state.nvml)
     }))
 }
 
@@ -262,11 +293,11 @@ fn build_cpu_info(sys: &System) -> CpuInfo {
     let physical = sys.physical_core_count().unwrap_or(logical / 2);
 
     CpuInfo {
-        usage_percent: (total_usage * 10.0).round() / 10.0,
+        usage_percent: round1_f32(total_usage),
         core_count_logical: logical,
         core_count_physical: physical,
         frequency_mhz: freq,
-        per_core_percent: per_core.iter().map(|v| (v * 10.0).round() / 10.0).collect(),
+        per_core_percent: per_core.iter().map(|v| round1_f32(*v)).collect(),
     }
 }
 
@@ -293,12 +324,236 @@ fn build_memory_info(sys: &System) -> MemoryInfo {
         total_gb: round2(bytes_to_gb(total)),
         used_gb: round2(bytes_to_gb(used)),
         available_gb: round2(bytes_to_gb(available)),
-        usage_percent: (usage_percent * 10.0).round() / 10.0,
+        usage_percent: round1_f32(usage_percent),
         swap_total_gb: round2(bytes_to_gb(swap_total)),
         swap_used_gb: round2(bytes_to_gb(swap_used)),
-        swap_percent: (swap_percent * 10.0).round() / 10.0,
+        swap_percent: round1_f32(swap_percent),
     }
 }
+
+// ─── GPU Support ──────────────────────────────────────────────────────────────
+
+fn build_gpu_info(nvml: &Option<nvml_wrapper::Nvml>) -> Vec<GpuInfo> {
+    let mut gpus = Vec::new();
+
+    // NVIDIA GPUs via NVML
+    if let Some(nvml) = nvml {
+        gpus.extend(collect_nvidia_gpus(nvml));
+    }
+
+    // AMD + Intel GPUs via sysfs (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        gpus.extend(collect_sysfs_gpus(gpus.len() as u32));
+    }
+
+    gpus
+}
+
+fn collect_nvidia_gpus(nvml: &nvml_wrapper::Nvml) -> Vec<GpuInfo> {
+    let count = match nvml.device_count() {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    (0..count)
+        .filter_map(|i| {
+            let dev = nvml.device_by_index(i).ok()?;
+            let mem = dev.memory_info().ok();
+            let (mem_total, mem_used, mem_pct) = mem
+                .map(|m| {
+                    let t = m.total / 1_048_576;
+                    let u = m.used / 1_048_576;
+                    let p = if m.total > 0 {
+                        (m.used as f64 / m.total as f64 * 100.0) as f32
+                    } else {
+                        0.0
+                    };
+                    (t, u, round1_f32(p))
+                })
+                .unwrap_or((0, 0, 0.0));
+
+            Some(GpuInfo {
+                index: i,
+                name: dev.name().unwrap_or_else(|_| "Unknown NVIDIA GPU".into()),
+                vendor: "NVIDIA".into(),
+                temperature_celsius: dev
+                    .temperature(
+                        nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu,
+                    )
+                    .ok(),
+                utilization_percent: dev.utilization_rates().ok().map(|u| u.gpu),
+                memory_total_mb: mem_total,
+                memory_used_mb: mem_used,
+                memory_usage_percent: mem_pct,
+                fan_speed_percent: dev.fan_speed(0).ok(),
+                power_draw_watts: dev
+                    .power_usage()
+                    .ok()
+                    .map(|mw| round2(mw as f64 / 1000.0)),
+                clock_speed_mhz: dev
+                    .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Graphics)
+                    .ok(),
+            })
+        })
+        .collect()
+}
+
+/// Scan /sys/class/drm for AMD (0x1002) and Intel (0x8086) GPUs.
+#[cfg(target_os = "linux")]
+fn collect_sysfs_gpus(start_idx: u32) -> Vec<GpuInfo> {
+    use std::fs;
+    use std::path::Path;
+
+    let drm = Path::new("/sys/class/drm");
+    if !drm.exists() {
+        return Vec::new();
+    }
+
+    let mut entries: Vec<_> = fs::read_dir(drm)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with("card") && !n.contains('-')
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut gpus = Vec::new();
+
+    for entry in &entries {
+        let card_path = entry.path();
+        let dev = card_path.join("device");
+
+        let vendor = fs::read_to_string(dev.join("vendor"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        let (vendor_name, default_name) = match vendor.as_str() {
+            "0x1002" => ("AMD", "AMD GPU"),
+            "0x8086" => ("Intel", "Intel GPU"),
+            _ => continue,
+        };
+
+        let name = fs::read_to_string(dev.join("product_name"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default_name.into());
+
+        let temp = sysfs_hwmon_read(&dev, "temp1_input").map(|v| (v / 1000) as u32);
+
+        // Utilization: AMD exposes gpu_busy_percent, Intel does not via sysfs
+        let util = sysfs_read_u64(&dev.join("gpu_busy_percent")).map(|v| v as u32);
+
+        // VRAM: AMD has mem_info_vram_*; Intel iGPUs use system RAM (no dedicated VRAM)
+        // For Intel, try mem_info_vram_* anyway (Intel Arc dGPUs expose it)
+        let vram_total =
+            sysfs_read_u64(&dev.join("mem_info_vram_total")).map(|b| b / 1_048_576);
+        let vram_used =
+            sysfs_read_u64(&dev.join("mem_info_vram_used")).map(|b| b / 1_048_576);
+
+        let (mt, mu, mp) = match (vram_total, vram_used) {
+            (Some(t), Some(u)) => {
+                let p = if t > 0 {
+                    (u as f64 / t as f64 * 100.0) as f32
+                } else {
+                    0.0
+                };
+                (t, u, round1_f32(p))
+            }
+            _ => (0, 0, 0.0),
+        };
+
+        let fan = sysfs_hwmon_fan_pct(&dev);
+        let power = sysfs_hwmon_read(&dev, "power1_average")
+            .map(|uw| round2(uw as f64 / 1_000_000.0));
+
+        // Clock speed: AMD uses pp_dpm_sclk, Intel uses gt_cur_freq_mhz
+        let clock = if vendor_name == "AMD" {
+            sysfs_amd_active_clock(&dev.join("pp_dpm_sclk"))
+        } else {
+            // Intel: gt_cur_freq_mhz is on the card dir, not device dir
+            sysfs_read_u64(&card_path.join("gt_cur_freq_mhz")).map(|v| v as u32)
+        };
+
+        gpus.push(GpuInfo {
+            index: start_idx + gpus.len() as u32,
+            name,
+            vendor: vendor_name.into(),
+            temperature_celsius: temp,
+            utilization_percent: util,
+            memory_total_mb: mt,
+            memory_used_mb: mu,
+            memory_usage_percent: mp,
+            fan_speed_percent: fan,
+            power_draw_watts: power,
+            clock_speed_mhz: clock,
+        });
+    }
+
+    gpus
+}
+
+/// Read a value from the first hwmon directory under a device path.
+#[cfg(target_os = "linux")]
+fn sysfs_hwmon_read(device_path: &std::path::Path, filename: &str) -> Option<u64> {
+    let hwmon = device_path.join("hwmon");
+    for entry in std::fs::read_dir(&hwmon).ok()?.flatten() {
+        if let Some(v) = sysfs_read_u64(&entry.path().join(filename)) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Read fan speed as a percentage from hwmon (fan1_input / fan1_max * 100).
+#[cfg(target_os = "linux")]
+fn sysfs_hwmon_fan_pct(device_path: &std::path::Path) -> Option<u32> {
+    let hwmon = device_path.join("hwmon");
+    for entry in std::fs::read_dir(&hwmon).ok()?.flatten() {
+        let p = entry.path();
+        let cur = sysfs_read_u64(&p.join("fan1_input"))?;
+        let max = sysfs_read_u64(&p.join("fan1_max")).filter(|&m| m > 0)?;
+        return Some((cur * 100 / max) as u32);
+    }
+    None
+}
+
+/// Parse the active clock from AMD's pp_dpm_sclk (line with `*` suffix).
+#[cfg(target_os = "linux")]
+fn sysfs_amd_active_clock(path: &std::path::Path) -> Option<u32> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        if line.contains('*') {
+            return line
+                .split_whitespace()
+                .find(|s| s.ends_with("Mhz") || s.ends_with("MHz"))
+                .and_then(|s| {
+                    s.trim_end_matches("Mhz")
+                        .trim_end_matches("MHz")
+                        .parse()
+                        .ok()
+                });
+        }
+    }
+    None
+}
+
+/// Read a u64 value from a sysfs file.
+#[cfg(target_os = "linux")]
+fn sysfs_read_u64(path: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+// ─── Disk & Network Builders ─────────────────────────────────────────────────
 
 fn build_disk_info(disks: &Disks) -> Vec<DiskInfo> {
     disks
@@ -321,7 +576,7 @@ fn build_disk_info(disks: &Disks) -> Vec<DiskInfo> {
                 total_gb: round2(bytes_to_gb(total)),
                 used_gb: round2(bytes_to_gb(used)),
                 free_gb: round2(bytes_to_gb(free)),
-                usage_percent: (usage_percent * 10.0).round() / 10.0,
+                usage_percent: round1_f32(usage_percent),
                 is_removable: d.is_removable(),
             }
         })
@@ -397,6 +652,28 @@ async fn main() {
             (acc.0 + d.total_transmitted(), acc.1 + d.total_received())
         });
 
+    // Initialize NVML for NVIDIA GPU monitoring
+    let nvml = match nvml_wrapper::Nvml::init() {
+        Ok(n) => {
+            let count = n.device_count().unwrap_or(0);
+            info!("NVML initialized — {} NVIDIA GPU(s) detected", count);
+            Some(n)
+        }
+        Err(_) => {
+            info!("NVML unavailable — no NVIDIA GPU support");
+            None
+        }
+    };
+
+    // Check for AMD/Intel GPUs on Linux
+    #[cfg(target_os = "linux")]
+    {
+        let sysfs_gpus = collect_sysfs_gpus(0);
+        for gpu in &sysfs_gpus {
+            info!("{} GPU detected via sysfs: {}", gpu.vendor, gpu.name);
+        }
+    }
+
     let state = Arc::new(AppState {
         sys: Mutex::new(sys),
         disks: Mutex::new(Disks::new_with_refreshed_list()),
@@ -406,6 +683,7 @@ async fn main() {
             bytes_recv: init_recv,
             taken_at: Instant::now(),
         }),
+        nvml,
         api_key,
     });
 
@@ -413,13 +691,32 @@ async fn main() {
     let local_ip = get_local_ip();
     let port = 8080u16;
 
+    let gpu_status = {
+        let gpus = build_gpu_info(&state.nvml);
+        if gpus.is_empty() {
+            "none detected".to_string()
+        } else {
+            gpus.iter()
+                .map(|g| format!("{} ({})", g.name, g.vendor))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+
     println!("\n{}", "=".repeat(52));
     println!("  Remote System Monitor — Rust Server");
     println!("{}", "=".repeat(52));
     println!("  Local URL:   http://localhost:{}", port);
-    println!("  Network URL: http://{}:{}  ← use in Android app", local_ip, port);
-    println!("  API Key:     {}...", &state.api_key[..8.min(state.api_key.len())]);
+    println!(
+        "  Network URL: http://{}:{}  ← use in Android app",
+        local_ip, port
+    );
+    println!(
+        "  API Key:     {}...",
+        &state.api_key[..8.min(state.api_key.len())]
+    );
     println!("  Header:      X-API-Key: <your-key>");
+    println!("  GPU:         {}", gpu_status);
     println!("  Optimised for 2s polling over local WiFi");
     println!("{}\n", "=".repeat(52));
 
@@ -434,6 +731,7 @@ async fn main() {
         .route("/metrics", get(get_metrics))
         .route("/metrics/cpu", get(get_cpu))
         .route("/metrics/memory", get(get_memory))
+        .route("/metrics/gpu", get(get_gpu))
         .route("/metrics/disk", get(get_disk))
         .route("/metrics/network", get(get_network))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))

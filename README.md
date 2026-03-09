@@ -118,6 +118,7 @@ All endpoints return JSON. Every request must include the `X-API-Key` header.
 | `GET /metrics` | Full system snapshot (all metrics below combined) |
 | `GET /metrics/cpu` | CPU usage %, core count, frequency, per-core usage |
 | `GET /metrics/memory` | RAM and swap: total, used, available, usage % |
+| `GET /metrics/gpu` | Per-GPU: name, vendor, temperature, utilization, VRAM, fan, power, clock |
 | `GET /metrics/disk` | Per-disk: name, mountpoint, filesystem, total/used/free, usage % |
 | `GET /metrics/network` | Upload/download speed (Mbps), total sent/received, packet counts |
 
@@ -166,6 +167,21 @@ Invoke-RestMethod -Uri http://localhost:8080/metrics -Headers @{"X-API-Key"="you
     "swap_used_gb": 0.5,
     "swap_percent": 12.5
   },
+  "gpu": [
+    {
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 3080",
+      "vendor": "NVIDIA",
+      "temperature_celsius": 65,
+      "utilization_percent": 42,
+      "memory_total_mb": 10240,
+      "memory_used_mb": 3584,
+      "memory_usage_percent": 35.0,
+      "fan_speed_percent": 55,
+      "power_draw_watts": 220.5,
+      "clock_speed_mhz": 1905
+    }
+  ],
   "disk": [
     {
       "name": "C:",
