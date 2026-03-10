@@ -41,7 +41,7 @@ Main Screen                          Stats Detail Screen
 5. [Stats Screen — Full Layout](#5-stats-screen--full-layout)
 6. [Reusable Components](#6-reusable-components)
 7. [Section Detail Screens](#7-section-detail-screens)
-8. [Polling Mechanism](#8-polling-mechanism)
+8. [Connection Strategy (WebSocket + REST fallback)](#8-connection-strategy)
 9. [Error Handling](#9-error-handling)
 10. [Wiring It Up — Navigation](#10-wiring-it-up--navigation)
 11. [Server Behavior Notes](#11-server-behavior-notes)
@@ -67,7 +67,8 @@ data class MetricsResponse(
     val memory: MemoryInfo,
     val gpu: List<GpuInfo>,
     val disk: List<DiskInfo>,
-    val network: NetworkInfo
+    val network: NetworkInfo,
+    val temperatures: List<TemperatureInfo>   // always present; may be empty
 )
 
 data class SystemInfo(
@@ -132,6 +133,38 @@ data class NetworkInfo(
     @SerializedName("packets_sent")        val packetsSent: Long,
     @SerializedName("packets_recv")        val packetsRecv: Long
 )
+
+data class TemperatureInfo(
+    val component: String,                                          // e.g. "CPU Package", "NVMe SSD", "acpitz"
+    @SerializedName("temperature_celsius") val temperatureCelsius: Float,
+    @SerializedName("max_celsius")         val maxCelsius: Float?,  // null if unavailable
+    @SerializedName("critical_celsius")    val criticalCelsius: Float?  // null if unavailable
+)
+```
+
+### WebSocket Message Types
+
+```kotlin
+// data/model/WsMessages.kt
+
+// Outbound (app → server)
+sealed class ClientMessage {
+    data class SetInterval(val ms: Int) : ClientMessage()
+    data class KillProcess(val pid: Int) : ClientMessage()
+    data object Ping : ClientMessage()
+}
+
+fun ClientMessage.toJson(): String = when (this) {
+    is ClientMessage.SetInterval  -> """{"action":"set_interval","ms":$ms}"""
+    is ClientMessage.KillProcess  -> """{"action":"kill_process","pid":$pid}"""
+    is ClientMessage.Ping         -> """{"action":"ping"}"""
+}
+
+// Inbound (server → app)
+data class WsFrame(
+    val event: String,      // "metrics"
+    val data: MetricsResponse? = null
+)
 ```
 
 ### Sub-Endpoint Wrappers (optional — if you poll individual endpoints)
@@ -174,7 +207,108 @@ data class ErrorResponse(val error: String)
 
 ## 2. Network Layer
 
-### Retrofit API Interface
+### WebSocket Client (primary — real-time push)
+
+The server pushes metrics over WebSocket at a configurable interval. Use OkHttp's built-in WebSocket support — no extra dependency needed if you already have OkHttp for Retrofit.
+
+```kotlin
+// data/remote/MonitorWebSocketClient.kt
+
+import com.google.gson.Gson
+import okhttp3.*
+import okhttp3.logging.HttpLoggingInterceptor
+import java.util.concurrent.TimeUnit
+
+class MonitorWebSocketClient(
+    private val serverUrl: String,   // e.g. "ws://192.168.1.100:8080/ws"
+    private val apiKey: String
+) {
+    private val gson = Gson()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.SECONDS)   // no timeout — server pushes continuously
+        .build()
+
+    private var webSocket: WebSocket? = null
+
+    var onMetrics: ((MetricsResponse) -> Unit)? = null
+    var onError: ((String) -> Unit)? = null
+    var onOpen: (() -> Unit)? = null
+    var onClosed: (() -> Unit)? = null
+
+    fun connect() {
+        val url = if (serverUrl.contains("?")) serverUrl else "$serverUrl?key=$apiKey"
+        val request = Request.Builder().url(url).build()
+        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                onOpen?.invoke()
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val frame = gson.fromJson(text, WsFrame::class.java)
+                    if (frame.event == "metrics" && frame.data != null) {
+                        onMetrics?.invoke(frame.data)
+                    }
+                } catch (e: Exception) {
+                    // ignore malformed frames
+                }
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                val msg = when {
+                    response?.code == 401 -> "Invalid API key"
+                    else -> t.message ?: "Connection failed"
+                }
+                onError?.invoke(msg)
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                onClosed?.invoke()
+            }
+        })
+    }
+
+    fun send(msg: ClientMessage) {
+        webSocket?.send(msg.toJson())
+    }
+
+    fun disconnect() {
+        webSocket?.close(1000, "App closed")
+        webSocket = null
+    }
+}
+```
+
+**Connection URL format:**
+```
+ws://<LOCAL_IP>:8080/ws?key=YOUR_API_KEY
+```
+
+**Allowed refresh intervals** (server enforces — reject any other value):
+
+| Label  | ms   |
+|--------|------|
+| 250ms  | 250  |
+| 500ms  | 500  |
+| 1s     | 1000 |
+| 2s     | 2000 |
+| 5s     | 5000 |
+
+Change interval while connected:
+```kotlin
+wsClient.send(ClientMessage.SetInterval(500))   // switch to 500ms updates
+```
+
+Kill a process:
+```kotlin
+wsClient.send(ClientMessage.KillProcess(pid = 1234))
+// Note: server blocks PIDs < 1000. Result logged server-side only (no ACK frame yet).
+```
+
+---
+
+### Retrofit API Interface (fallback REST polling)
 
 ```kotlin
 // data/remote/MonitorApi.kt
@@ -293,17 +427,27 @@ sealed class ConnectionState {
     data class Error(val message: String) : ConnectionState()
 }
 
+// Allowed WebSocket refresh intervals
+enum class RefreshInterval(val ms: Int, val label: String) {
+    MS_250(250, "250ms"),
+    MS_500(500, "500ms"),
+    S_1(1000, "1s"),
+    S_2(2000, "2s"),
+    S_5(5000, "5s");
+    companion object { val default = S_2 }
+}
+
 data class ServerStatsState(
     val connectionState: ConnectionState = ConnectionState.Connecting,
     val metrics: MetricsResponse? = null,
     val lastUpdated: String = "",
-    val isPolling: Boolean = false
+    val refreshInterval: RefreshInterval = RefreshInterval.default
 )
 ```
 
 ### ViewModel
 
-This ViewModel receives the server URL + API key when the user taps a server in the list. It starts polling immediately and stops when the screen is left.
+Uses WebSocket for real-time push. Falls back to REST polling if WebSocket fails.
 
 ```kotlin
 // viewmodel/ServerStatsViewModel.kt
@@ -323,28 +467,91 @@ class ServerStatsViewModel : ViewModel() {
     private val _state = MutableStateFlow(ServerStatsState())
     val state = _state.asStateFlow()
 
-    private var pollingJob: Job? = null
-    private var repository: MonitorRepository? = null
-
-    companion object {
-        const val POLL_INTERVAL_MS = 2000L
-    }
+    private var wsClient: MonitorWebSocketClient? = null
+    private var fallbackJob: Job? = null
+    private var serverUrl: String = ""
+    private var apiKey: String = ""
 
     /**
      * Call this when the stats screen opens with a specific server's details.
      */
     fun startMonitoring(serverUrl: String, apiKey: String) {
-        if (pollingJob?.isActive == true) return  // already monitoring
+        if (wsClient != null) return  // already monitoring
+        this.serverUrl = serverUrl
+        this.apiKey = apiKey
 
+        _state.update { it.copy(connectionState = ConnectionState.Connecting) }
+
+        // Derive WebSocket URL from HTTP URL
+        val wsUrl = serverUrl
+            .replace("http://", "ws://")
+            .replace("https://", "wss://")
+            .trimEnd('/') + "/ws"
+
+        wsClient = MonitorWebSocketClient(wsUrl, apiKey).apply {
+            onOpen = {
+                _state.update { it.copy(connectionState = ConnectionState.Connected) }
+                fallbackJob?.cancel()   // cancel REST fallback if it was running
+            }
+            onMetrics = { metrics ->
+                _state.update {
+                    it.copy(
+                        connectionState = ConnectionState.Connected,
+                        metrics = metrics,
+                        lastUpdated = metrics.timestamp
+                    )
+                }
+            }
+            onError = { msg ->
+                _state.update { it.copy(connectionState = ConnectionState.Error(msg)) }
+                startRestFallback()     // fall back to REST polling on WS failure
+            }
+            onClosed = {
+                _state.update { it.copy(connectionState = ConnectionState.Disconnected) }
+            }
+            connect()
+        }
+    }
+
+    /**
+     * Switch the server's push interval. Sends SetInterval over the WebSocket.
+     * Only allowed values: 250, 500, 1000, 2000, 5000 ms.
+     */
+    fun setRefreshInterval(interval: RefreshInterval) {
+        wsClient?.send(ClientMessage.SetInterval(interval.ms))
+        _state.update { it.copy(refreshInterval = interval) }
+    }
+
+    /**
+     * Kill a process on the server. PID < 1000 will be rejected by the server.
+     */
+    fun killProcess(pid: Int) {
+        wsClient?.send(ClientMessage.KillProcess(pid))
+    }
+
+    fun stopMonitoring() {
+        wsClient?.disconnect()
+        wsClient = null
+        fallbackJob?.cancel()
+        fallbackJob = null
+        _state.update { it.copy(connectionState = ConnectionState.Disconnected) }
+    }
+
+    override fun onCleared() {
+        stopMonitoring()
+        super.onCleared()
+    }
+
+    // ── REST fallback ────────────────────────────────────────────────────────
+
+    private fun startRestFallback() {
+        if (fallbackJob?.isActive == true) return
         val api = ApiClientFactory.create(serverUrl, apiKey)
-        repository = MonitorRepository(api)
-
-        _state.update { it.copy(connectionState = ConnectionState.Connecting, isPolling = true) }
-
-        pollingJob = viewModelScope.launch {
+        val repo = MonitorRepository(api)
+        fallbackJob = viewModelScope.launch {
             while (isActive) {
-                repository?.fetchMetrics()
-                    ?.onSuccess { metrics ->
+                repo.fetchMetrics()
+                    .onSuccess { metrics ->
                         _state.update {
                             it.copy(
                                 connectionState = ConnectionState.Connected,
@@ -353,32 +560,18 @@ class ServerStatsViewModel : ViewModel() {
                             )
                         }
                     }
-                    ?.onFailure { error ->
+                    .onFailure { error ->
                         val msg = when (error) {
                             is AuthException -> "Invalid API key"
                             is java.net.ConnectException -> "Cannot reach server"
                             is java.net.SocketTimeoutException -> "Connection timed out"
                             else -> error.message ?: "Unknown error"
                         }
-                        _state.update {
-                            it.copy(connectionState = ConnectionState.Error(msg))
-                        }
+                        _state.update { it.copy(connectionState = ConnectionState.Error(msg)) }
                     }
-
-                delay(POLL_INTERVAL_MS)
+                delay(2000L)
             }
         }
-    }
-
-    fun stopMonitoring() {
-        pollingJob?.cancel()
-        pollingJob = null
-        _state.update { it.copy(isPolling = false) }
-    }
-
-    override fun onCleared() {
-        stopMonitoring()
-        super.onCleared()
     }
 }
 ```
@@ -494,6 +687,30 @@ fun ServerStatsScreen(
                     }
                 },
                 actions = {
+                    // Refresh interval picker
+                    var showIntervalMenu by remember { mutableStateOf(false) }
+                    Box {
+                        TextButton(onClick = { showIntervalMenu = true }) {
+                            Text(state.refreshInterval.label)
+                        }
+                        DropdownMenu(
+                            expanded = showIntervalMenu,
+                            onDismissRequest = { showIntervalMenu = false }
+                        ) {
+                            RefreshInterval.entries.forEach { interval ->
+                                DropdownMenuItem(
+                                    text = { Text(interval.label) },
+                                    onClick = {
+                                        viewModel.setRefreshInterval(interval)
+                                        showIntervalMenu = false
+                                    },
+                                    leadingIcon = if (interval == state.refreshInterval) {
+                                        { Icon(Icons.Filled.Check, contentDescription = null) }
+                                    } else null
+                                )
+                            }
+                        }
+                    }
                     ConnectionStatusDot(state.connectionState)
                 }
             )
@@ -595,6 +812,14 @@ private fun StatsContent(
 
         // Network
         item { NetworkOverviewCard(metrics.network) }
+
+        // Temperatures (only show if any sensors reported)
+        if (metrics.temperatures.isNotEmpty()) {
+            item {
+                Text("Temperatures", style = MaterialTheme.typography.titleMedium)
+            }
+            item { TemperatureCard(metrics.temperatures) }
+        }
 
         // Timestamp footer
         item {
@@ -1097,6 +1322,73 @@ private fun SpeedColumn(label: String, speedMbps: Double, arrow: String) {
 }
 ```
 
+### Temperature Card
+
+```kotlin
+// ui/components/TemperatureCard.kt
+
+@Composable
+fun TemperatureCard(sensors: List<TemperatureInfo>) {
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp)) {
+            sensors.forEach { sensor ->
+                TemperatureRow(sensor)
+                if (sensor != sensors.last()) {
+                    HorizontalDivider(Modifier.padding(vertical = 4.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TemperatureRow(sensor: TemperatureInfo) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(sensor.component, style = MaterialTheme.typography.bodyMedium)
+            sensor.criticalCelsius?.let {
+                Text("Critical: ${it}°C", style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        Column(horizontalAlignment = Alignment.End) {
+            Text(
+                "${sensor.temperatureCelsius}°C",
+                style = MaterialTheme.typography.titleMedium,
+                color = tempColor(sensor.temperatureCelsius, sensor.criticalCelsius)
+            )
+            sensor.maxCelsius?.let {
+                Text("max ${it}°C", style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@Composable
+fun tempColor(current: Float, critical: Float?): Color {
+    val threshold = critical ?: 95f
+    return when {
+        current >= threshold * 0.9f -> MaterialTheme.colorScheme.error
+        current >= threshold * 0.75f -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.primary
+    }
+}
+```
+
+> **Temperature unit conversion (client-side):** The server always sends °C. Convert locally:
+> ```kotlin
+> fun Float.toDisplayTemp(useFahrenheit: Boolean): String =
+>     if (useFahrenheit) "%.1f°F".format(this * 9f / 5f + 32f)
+>     else "%.1f°C".format(this)
+> ```
+
+---
+
 ### Shared Utility Functions
 
 ```kotlin
@@ -1431,26 +1723,34 @@ fun NetworkDetailScreen(network: NetworkInfo, onBack: () -> Unit) {
 
 ---
 
-## 8. Polling Mechanism
+## 8. Connection Strategy
 
-### Summary
+### Primary: WebSocket (real-time push)
+
+| Aspect            | Value                                                                           |
+| ----------------- | ------------------------------------------------------------------------------- |
+| **Endpoint**      | `ws://<ip>:8080/ws?key=<apiKey>`                                                |
+| **Auth**          | `?key=` query param at connection time — no header needed                       |
+| **Default push**  | Every 2000ms (server-side interval)                                             |
+| **Intervals**     | 250 / 500 / 1000 / 2000 / 5000 ms — send `SetInterval` to change               |
+| **Lifecycle**     | Disconnect on `ON_STOP`, reconnect on `ON_START`                                |
+| **On WS failure** | Fall back to REST polling at 2s interval                                        |
+
+### Fallback: REST Polling (`GET /metrics`)
 
 | Aspect          | Value                                                                           |
 | --------------- | ------------------------------------------------------------------------------- |
 | **Endpoint**    | `GET /metrics` (full snapshot, ~1 KB payload)                                   |
-| **Interval**    | 2000ms — matches server design                                                  |
-| **Lifecycle**   | Pause on `ON_STOP`, resume on `ON_START`                                        |
-| **Timeout**     | 5s connect + 5s read — fail fast                                                |
-| **On error**    | Keep polling — next attempt in 2s is auto-retry. Show stale data + error banner |
+| **Interval**    | 2000ms                                                                          |
 | **Auth header** | `X-API-Key: <value>` on every request                                           |
+| **Timeout**     | 5s connect + 5s read                                                            |
+| **On error**    | Keep retrying every 2s. Show stale data + error banner                          |
 
-### Why poll `/metrics` and not individual endpoints?
-
-The full `/metrics` response is small (~1 KB) and returns everything in one request. Making 4 separate calls (`/cpu`, `/memory`, `/disk`, `/network`) would be 4x the overhead for negligible savings. Use individual endpoints only if you add a view that monitors just one metric.
+Use individual endpoints (`/metrics/cpu`, etc.) only if you need a single-metric view — the full `/metrics` payload (~1 KB) is cheaper than 4 separate requests.
 
 ### Network speed accuracy
 
-The server calculates upload/download speed as `(bytes_now - bytes_previous) / elapsed_seconds`. With 2s polling, the speed is an average over the last 2 seconds. The **first** response after server start shows speed since boot — it stabilizes on the 2nd poll.
+The server calculates upload/download speed as `(bytes_now - bytes_previous) / elapsed_seconds`. With 2s push interval, the speed is an average over the last 2 seconds. The **first** response after server start shows speed since boot — it stabilizes on the 2nd push.
 
 ---
 
@@ -1519,8 +1819,13 @@ Things to be aware of when building the UI:
 | **All disks are returned**                         | Including virtual filesystems on Linux (tmpfs, devtmpfs, etc.). You may want to filter out disks with `total_gb == 0` or specific filesystem types.                                             |
 | **`gpu` is always an array**                       | Empty `[]` if no GPU detected (e.g., headless server, integrated-only). Multiple entries for multi-GPU. Always check `gpu.isNotEmpty()` before showing the GPU section.                         |
 | **GPU fields are nullable**                        | `temperature_celsius`, `utilization_percent`, `fan_speed_percent`, `power_draw_watts`, `clock_speed_mhz` can be `null` if the GPU/driver doesn't expose that metric. Use `?.let {}` in Compose. |
-| **NVIDIA vs AMD vs Intel GPU support**             | NVIDIA GPUs use NVML (full metrics). AMD/Intel GPUs use Linux sysfs (fewer fields). `vendor` is `"NVIDIA"`, `"AMD"`, or `"Intel"`. Intel iGPUs typically only report clock speed.               |
+| **NVIDIA vs AMD vs Intel GPU support**             | NVIDIA GPUs use NVML (full metrics). AMD/Intel use Linux sysfs or Windows WMI (fewer fields). `vendor` is `"NVIDIA"`, `"AMD"`, or `"Intel"`. Intel iGPUs typically only report clock speed. AMD/Intel on Windows report name + VRAM only (no temp/util/power). |
 | **GPU VRAM is in MB, not GB**                      | Unlike RAM/disk which use GB, GPU memory uses `memory_total_mb` / `memory_used_mb` in **megabytes**. Intel iGPUs share system RAM so VRAM fields will be 0.                                     |
+| **`temperatures` may be empty**                    | The array is always present but may be empty if the OS doesn't expose sensors or the server lacks permissions (common on Windows without admin). Always guard with `isNotEmpty()`.               |
+| **Temperature values are always °C**               | The server never sends °F. Convert on the client based on user preference: `celsius * 9f / 5f + 32f`.                                                                                          |
+| **WebSocket auth is via query param, not header**  | Connect as `ws://<ip>:8080/ws?key=<apiKey>`. A wrong key returns HTTP 401 before the upgrade — OkHttp surfaces this as `onFailure` with a non-null `response` whose `code` is 401.             |
+| **Kill process has no ACK frame (yet)**            | After sending `KillProcess`, the server logs the result server-side but does not send a confirmation frame back. Show a local toast and re-poll the process list to confirm.                    |
+| **WebSocket drops if server restarts**             | Reconnect logic should be in the ViewModel. The provided ViewModel falls back to REST on failure — you may also add exponential-backoff WebSocket reconnect.                                    |
 
 ---
 
@@ -1591,7 +1896,12 @@ Things to be aware of when building the UI:
     "total_recv_gb": 5.678,
     "packets_sent": 123456,
     "packets_recv": 789012
-  }
+  },
+  "temperatures": [
+    { "component": "CPU Package",  "temperature_celsius": 62.0, "max_celsius": 75.0, "critical_celsius": 100.0 },
+    { "component": "NVMe SSD",     "temperature_celsius": 38.5, "max_celsius": 45.0, "critical_celsius": null  },
+    { "component": "acpitz",       "temperature_celsius": 27.8, "max_celsius": null,  "critical_celsius": null  }
+  ]
 }
 ```
 
@@ -1605,11 +1915,32 @@ Things to be aware of when building the UI:
 }
 ```
 
+### WebSocket — Inbound frames (server → app)
+
+Every frame has an `"event"` tag:
+
+```json
+{ "event": "metrics", "data": { ...full MetricsResponse... } }
+```
+
+### WebSocket — Outbound messages (app → server)
+
+```json
+{ "action": "set_interval", "ms": 500   }
+{ "action": "set_interval", "ms": 1000  }
+{ "action": "kill_process", "pid": 1234 }
+{ "action": "ping"                      }
+```
+
+Allowed `ms` values: **250, 500, 1000, 2000, 5000** — any other value is rejected with a server-side warning (no error frame sent back yet).
+
 ### `401 Unauthorized` — Wrong/missing API key
 
 ```json
 { "error": "missing or invalid API key" }
 ```
+
+This is returned as an HTTP 401 response to the WebSocket upgrade request (before the connection is established), or to any REST request with a missing/wrong `X-API-Key` header.
 
 ### Type Mapping: Server → Android
 
