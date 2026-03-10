@@ -5,11 +5,11 @@ use std::{
 };
 
 use axum::{
-    extract::{ws::WebSocketUpgrade, Request, State},
+    extract::{ws::WebSocketUpgrade, Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use chrono::Local;
@@ -139,6 +139,27 @@ struct TemperatureInfo {
     critical_celsius: Option<f32>,
 }
 
+#[derive(Serialize)]
+struct ProcessInfoResponse {
+    pid: u32,
+    name: String,
+    cpu_percent: f32,
+    memory_percent: f32,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct ProcessListResponse {
+    timestamp: String,
+    processes: Vec<ProcessInfoResponse>,
+}
+
+#[derive(Serialize)]
+struct KillProcessResponse {
+    success: bool,
+    message: String,
+}
+
 /// Inbound messages from the Android client
 #[derive(serde::Deserialize, Debug)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -247,7 +268,7 @@ async fn root() -> Json<serde_json::Value> {
         "status": "ok",
         "message": "Remote System Monitor (Rust) is running",
         "version": "1.0.0",
-        "endpoints": ["/metrics", "/metrics/cpu", "/metrics/memory", "/metrics/gpu", "/metrics/disk", "/metrics/network", "/health"]
+        "endpoints": ["/metrics", "/metrics/cpu", "/metrics/memory", "/metrics/gpu", "/metrics/disk", "/metrics/network", "/processes", "/process/{pid}/kill", "/health"]
     }))
 }
 
@@ -338,6 +359,52 @@ async fn get_network(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         "timestamp": Local::now().to_rfc3339(),
         "network": net
     }))
+}
+
+async fn get_processes(State(state): State<Arc<AppState>>) -> Json<ProcessListResponse> {
+    let mut sys = state.sys.lock().unwrap();
+    sys.refresh_processes();
+
+    let total_mem = sys.total_memory() as f64;
+    let processes: Vec<ProcessInfoResponse> = sys
+        .processes()
+        .iter()
+        .map(|(pid, proc_)| {
+            let status = format!("{:?}", proc_.status());
+            ProcessInfoResponse {
+                pid: pid.as_u32(),
+                name: proc_.name().to_string(),
+                cpu_percent: round1_f32(proc_.cpu_usage()),
+                memory_percent: if total_mem > 0.0 {
+                    round1_f32((proc_.memory() as f64 / total_mem * 100.0) as f32)
+                } else {
+                    0.0
+                },
+                status: status.to_lowercase(),
+            }
+        })
+        .collect();
+
+    Json(ProcessListResponse {
+        timestamp: Local::now().to_rfc3339(),
+        processes,
+    })
+}
+
+async fn post_kill_process(
+    State(state): State<Arc<AppState>>,
+    Path(pid): Path<u32>,
+) -> Json<KillProcessResponse> {
+    match kill_process(&state, pid) {
+        Ok(()) => Json(KillProcessResponse {
+            success: true,
+            message: format!("Process {} killed successfully", pid),
+        }),
+        Err(e) => Json(KillProcessResponse {
+            success: false,
+            message: e,
+        }),
+    }
 }
 
 async fn ws_handler(
@@ -1037,6 +1104,8 @@ async fn main() {
         .route("/metrics/gpu", get(get_gpu))
         .route("/metrics/disk", get(get_disk))
         .route("/metrics/network", get(get_network))
+        .route("/processes", get(get_processes))
+        .route("/process/{pid}/kill", post(post_kill_process))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     let app = public
