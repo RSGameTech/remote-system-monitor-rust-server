@@ -1,0 +1,14 @@
+/home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/deps/serde-46730876d2af9b81.d: /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/build/serde-1a01fa5987339ae9/out/private.rs
+
+/home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/deps/libserde-46730876d2af9b81.rlib: /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/build/serde-1a01fa5987339ae9/out/private.rs
+
+/home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/deps/libserde-46730876d2af9b81.rmeta: /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/build/serde-1a01fa5987339ae9/out/private.rs
+
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/build/serde-1a01fa5987339ae9/out/private.rs:
+
+# env-dep:OUT_DIR=/home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/build/serde-1a01fa5987339ae9/out

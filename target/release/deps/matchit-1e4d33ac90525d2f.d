@@ -1,0 +1,11 @@
+/home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/deps/matchit-1e4d33ac90525d2f.d: /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/lib.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/error.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/params.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/router.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/tree.rs
+
+/home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/deps/libmatchit-1e4d33ac90525d2f.rlib: /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/lib.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/error.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/params.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/router.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/tree.rs
+
+/home/rsgametech/Coding/remote-system-monitor-rust-server/target/release/deps/libmatchit-1e4d33ac90525d2f.rmeta: /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/lib.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/error.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/params.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/router.rs /home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/tree.rs
+
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/lib.rs:
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/error.rs:
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/params.rs:
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/router.rs:
+/home/rsgametech/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/matchit-0.7.3/src/tree.rs:

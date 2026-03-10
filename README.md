@@ -25,11 +25,13 @@ cd remote-system-monitor-rust-server
 Every request to the server requires an `X-API-Key` header. You must set the key as an environment variable before running.
 
 **PowerShell:**
+
 ```powershell
 $env:MONITOR_API_KEY = "your-secret-key-here"
 ```
 
 **Bash / Linux / macOS:**
+
 ```bash
 export MONITOR_API_KEY="your-secret-key-here"
 ```
@@ -39,11 +41,13 @@ Pick any string you like as your key. You'll use this same key in your Android a
 ### 3. Build and run
 
 **Debug mode (faster compile, slower runtime):**
+
 ```bash
 cargo run
 ```
 
 **Release mode (slower compile, optimized binary):**
+
 ```bash
 cargo run --release
 ```
@@ -79,6 +83,7 @@ Windows Firewall may block incoming connections on port 8080. To allow it:
 7. Name it `System Monitor Server` > Finish
 
 Or via PowerShell (run as Administrator):
+
 ```powershell
 New-NetFirewallRule -DisplayName "System Monitor Server" -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow -Profile Private
 ```
@@ -86,50 +91,57 @@ New-NetFirewallRule -DisplayName "System Monitor Server" -Direction Inbound -Loc
 #### Linux
 
 **ufw (Ubuntu/Debian):**
+
 ```bash
 sudo ufw allow 8080/tcp
 ```
 
 **firewalld (Fedora/RHEL):**
+
 ```bash
 sudo firewall-cmd --add-port=8080/tcp --permanent
 sudo firewall-cmd --reload
 ```
 
 **iptables (any distro):**
+
 ```bash
 sudo iptables -A INPUT -p tcp --dport 8080 -j ACCEPT
 ```
 
 **NixOS (via configuration.nix):**
+
 ```nix
 networking.firewall.allowedTCPPorts = [ 8080 ];
 ```
+
 Then rebuild: `sudo nixos-rebuild switch`
 
 ## API Endpoints
 
 All endpoints return JSON. Every request must include the `X-API-Key` header.
 
-| Endpoint | Description |
-|---|---|
-| `GET /` | Server info and list of available endpoints |
-| `GET /health` | Health check (status, timestamp, version) |
-| `GET /metrics` | Full system snapshot (all metrics below combined) |
-| `GET /metrics/cpu` | CPU usage %, core count, frequency, per-core usage |
-| `GET /metrics/memory` | RAM and swap: total, used, available, usage % |
-| `GET /metrics/gpu` | Per-GPU: name, vendor, temperature, utilization, VRAM, fan, power, clock |
-| `GET /metrics/disk` | Per-disk: name, mountpoint, filesystem, total/used/free, usage % |
-| `GET /metrics/network` | Upload/download speed (Mbps), total sent/received, packet counts |
+| Endpoint               | Description                                                              |
+| ---------------------- | ------------------------------------------------------------------------ |
+| `GET /`                | Server info and list of available endpoints                              |
+| `GET /health`          | Health check (status, timestamp, version)                                |
+| `GET /metrics`         | Full system snapshot (all metrics below combined)                        |
+| `GET /metrics/cpu`     | CPU usage %, core count, frequency, per-core usage                       |
+| `GET /metrics/memory`  | RAM and swap: total, used, available, usage %                            |
+| `GET /metrics/gpu`     | Per-GPU: name, vendor, temperature, utilization, VRAM, fan, power, clock |
+| `GET /metrics/disk`    | Per-disk: name, mountpoint, filesystem, total/used/free, usage %         |
+| `GET /metrics/network` | Upload/download speed (Mbps), total sent/received, packet counts         |
 
 ## Testing the API
 
 **curl:**
+
 ```bash
 curl -H "X-API-Key: your-secret-key-here" http://localhost:8080/metrics
 ```
 
 **PowerShell:**
+
 ```powershell
 Invoke-RestMethod -Uri http://localhost:8080/metrics -Headers @{"X-API-Key"="your-secret-key-here"}
 ```
@@ -225,6 +237,7 @@ cargo build --release
 ```
 
 The optimized binary will be at:
+
 - **Windows:** `target/release/monitor.exe`
 - **Linux:** `target/release/monitor`
 
