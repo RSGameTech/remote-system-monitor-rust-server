@@ -212,8 +212,11 @@ fn kill_process(state: &Arc<AppState>, pid: u32) -> Result<(), String> {
                 process.name(),
                 pid
             );
-            process.kill();
-            Ok(())
+            if process.kill() {
+                Ok(())
+            } else {
+                Err(format!("Failed to send kill signal to PID {}", pid))
+            }
         }
         None => Err(format!("PID {} not found", pid)),
     }
@@ -378,15 +381,6 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Rebuild interval if client changed it
-                    if interval_rx.has_changed().unwrap_or(false) {
-                        current_ms = *interval_rx.borrow_and_update();
-                        interval = tokio::time::interval(
-                            std::time::Duration::from_millis(current_ms)
-                        );
-                        interval.tick().await; // skip immediate first tick
-                    }
-
                     let metrics = collect_full_metrics(&state_clone).await;
                     let msg = ServerMessage::Metrics { data: metrics };
                     let json = serde_json::to_string(&msg).unwrap();
@@ -394,6 +388,13 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
                     if sender.send(Message::Text(json)).await.is_err() {
                         break; // client disconnected
                     }
+                }
+                _ = interval_rx.changed() => {
+                    current_ms = *interval_rx.borrow_and_update();
+                    interval = tokio::time::interval(
+                        std::time::Duration::from_millis(current_ms)
+                    );
+                    interval.tick().await; // skip immediate first tick after change
                 }
             }
         }
@@ -766,7 +767,7 @@ fn collect_wmi_gpus(start_idx: u32) -> Vec<GpuInfo> {
     struct Win32VideoController {
         Name: String,
         AdapterCompatibility: Option<String>,
-        AdapterRAM: Option<u32>,
+        AdapterRAM: Option<u64>,
     }
 
     let com_lib = match COMLibrary::new() {
@@ -804,7 +805,7 @@ fn collect_wmi_gpus(start_idx: u32) -> Vec<GpuInfo> {
                 return None; // skip NVIDIA (handled by NVML) and unknowns
             };
 
-            let mem_mb = c.AdapterRAM.map(|b| b as u64 / 1_048_576).unwrap_or(0);
+            let mem_mb = c.AdapterRAM.map(|b| b / 1_048_576).unwrap_or(0);
 
             Some(GpuInfo {
                 index: 0, // assigned below
