@@ -683,10 +683,9 @@ fn collect_wmi_gpus(start_idx: u32) -> Vec<GpuInfo> {
         }
     };
 
-    controllers
+    let mut result: Vec<GpuInfo> = controllers
         .into_iter()
-        .enumerate()
-        .filter_map(|(i, c)| {
+        .filter_map(|c| {
             let compat = c.AdapterCompatibility.as_deref().unwrap_or("").to_lowercase();
             let vendor = if compat.contains("intel") {
                 "Intel"
@@ -696,11 +695,10 @@ fn collect_wmi_gpus(start_idx: u32) -> Vec<GpuInfo> {
                 return None; // skip NVIDIA (handled by NVML) and unknowns
             };
 
-            // AdapterRAM is a u32 in WMI — capped at ~4 GB for older drivers.
             let mem_mb = c.AdapterRAM.map(|b| b as u64 / 1_048_576).unwrap_or(0);
 
             Some(GpuInfo {
-                index: start_idx + i as u32,
+                index: 0, // assigned below
                 name: c.Name,
                 vendor: vendor.to_string(),
                 temperature_celsius: None,
@@ -713,7 +711,12 @@ fn collect_wmi_gpus(start_idx: u32) -> Vec<GpuInfo> {
                 clock_speed_mhz: None,
             })
         })
-        .collect()
+        .collect();
+
+    for (i, gpu) in result.iter_mut().enumerate() {
+        gpu.index = start_idx + i as u32;
+    }
+    result
 }
 
 // ─── Disk & Network Builders ─────────────────────────────────────────────────
