@@ -5,7 +5,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Request, State},
+    extract::{ws::WebSocketUpgrade, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
@@ -335,6 +335,115 @@ async fn get_network(State(state): State<Arc<AppState>>) -> Json<serde_json::Val
         "timestamp": Local::now().to_rfc3339(),
         "network": net
     }))
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    // Auth: validate ?key= query param at upgrade time
+    match params.get("key").map(|k| k.as_str()) {
+        Some(key) if key == state.api_key => {}
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "missing or invalid API key" })),
+            )
+                .into_response();
+        }
+    }
+
+    ws.on_upgrade(move |socket| handle_ws(socket, state))
+}
+
+async fn handle_ws(socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::sync::watch;
+
+    let (mut sender, mut receiver) = socket.split();
+
+    // Shared interval between recv task and send loop (default 2s)
+    let (interval_tx, mut interval_rx) = watch::channel(2000u64);
+
+    // ── Task A: push metrics on interval ────────────────────────────────────
+    let state_clone = state.clone();
+    let mut send_task = tokio::spawn(async move {
+        let mut current_ms = *interval_rx.borrow();
+        let mut interval = tokio::time::interval(
+            std::time::Duration::from_millis(current_ms)
+        );
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Rebuild interval if client changed it
+                    if interval_rx.has_changed().unwrap_or(false) {
+                        current_ms = *interval_rx.borrow_and_update();
+                        interval = tokio::time::interval(
+                            std::time::Duration::from_millis(current_ms)
+                        );
+                        interval.tick().await; // skip immediate first tick
+                    }
+
+                    let metrics = collect_full_metrics(&state_clone).await;
+                    let msg = ServerMessage::Metrics { data: metrics };
+                    let json = serde_json::to_string(&msg).unwrap();
+
+                    if sender.send(Message::Text(json)).await.is_err() {
+                        break; // client disconnected
+                    }
+                }
+            }
+        }
+    });
+
+    // ── Task B: receive commands from Android ────────────────────────────────
+    let state_clone2 = state.clone();
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                Message::Text(text) => {
+                    match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(ClientMessage::SetInterval { ms }) => {
+                            match validate_interval(ms) {
+                                Ok(valid_ms) => {
+                                    let _ = interval_tx.send(valid_ms);
+                                    tracing::info!("Client set interval to {}ms", valid_ms);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Invalid interval: {}", e);
+                                }
+                            }
+                        }
+                        Ok(ClientMessage::KillProcess { pid }) => {
+                            let result = kill_process(&state_clone2, pid);
+                            tracing::warn!(
+                                "Kill request for PID {}: {}",
+                                pid,
+                                if result.is_ok() { "success" } else { "failed" }
+                            );
+                        }
+                        Ok(ClientMessage::Ping) => {
+                            tracing::debug!("Ping received");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Unparseable WS message: {}", e);
+                        }
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // If either task exits, abort the other
+    tokio::select! {
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
+    }
 }
 
 // ─── Builders ─────────────────────────────────────────────────────────────────
@@ -878,12 +987,16 @@ async fn main() {
         local_ip, port
     );
     println!(
+        "  WebSocket:   ws://{}:{}/ws  ← real-time feed",
+        local_ip, port
+    );
+    println!(
         "  API Key:     {}...",
         &state.api_key[..8.min(state.api_key.len())]
     );
     println!("  Header:      X-API-Key: <your-key>");
     println!("  GPU:         {}", gpu_status);
-    println!("  Optimised for 2s polling over local WiFi");
+    println!("  WebSocket refresh: 250ms / 500ms / 1s / 2s (default) / 5s");
     println!("{}\n", "=".repeat(52));
 
     let cors = CorsLayer::new()
@@ -891,7 +1004,10 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new()
+    let public = Router::new()
+        .route("/ws", get(ws_handler));
+
+    let protected = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/metrics", get(get_metrics))
@@ -900,7 +1016,10 @@ async fn main() {
         .route("/metrics/gpu", get(get_gpu))
         .route("/metrics/disk", get(get_disk))
         .route("/metrics/network", get(get_network))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    let app = public
+        .merge(protected)
         .layer(cors)
         .with_state(state);
 
