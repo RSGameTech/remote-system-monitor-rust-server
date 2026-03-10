@@ -363,12 +363,15 @@ async fn ws_handler(
 async fn handle_ws(socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
     use axum::extract::ws::Message;
     use futures_util::{SinkExt, StreamExt};
-    use tokio::sync::watch;
+    use tokio::sync::{mpsc, watch};
 
     let (mut sender, mut receiver) = socket.split();
 
     // Shared interval between recv task and send loop (default 2s)
     let (interval_tx, mut interval_rx) = watch::channel(2000u64);
+
+    // Reply channel: recv_task sends Pong/KillResult/Error back through send_task
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
     // ── Task A: push metrics on interval ────────────────────────────────────
     let state_clone = state.clone();
@@ -396,6 +399,12 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
                     );
                     interval.tick().await; // skip immediate first tick after change
                 }
+                Some(reply) = reply_rx.recv() => {
+                    let json = serde_json::to_string(&reply).unwrap();
+                    if sender.send(Message::Text(json)).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -415,22 +424,33 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: Arc<AppState>) {
                                 }
                                 Err(e) => {
                                     tracing::warn!("Invalid interval: {}", e);
+                                    let _ = reply_tx.send(ServerMessage::Error { message: e });
                                 }
                             }
                         }
                         Ok(ClientMessage::KillProcess { pid }) => {
                             let result = kill_process(&state_clone2, pid);
+                            let success = result.is_ok();
                             tracing::warn!(
                                 "Kill request for PID {}: {}",
                                 pid,
-                                if result.is_ok() { "success" } else { "failed" }
+                                if success { "success" } else { "failed" }
                             );
+                            let _ = reply_tx.send(ServerMessage::KillResult {
+                                pid,
+                                success,
+                                error: result.err(),
+                            });
                         }
                         Ok(ClientMessage::Ping) => {
                             tracing::debug!("Ping received");
+                            let _ = reply_tx.send(ServerMessage::Pong);
                         }
                         Err(e) => {
                             tracing::warn!("Unparseable WS message: {}", e);
+                            let _ = reply_tx.send(ServerMessage::Error {
+                                message: format!("Unrecognised message: {}", e),
+                            });
                         }
                     }
                 }
