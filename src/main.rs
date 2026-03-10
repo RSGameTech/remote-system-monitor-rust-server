@@ -195,6 +195,30 @@ fn validate_interval(ms: u64) -> Result<u64, String> {
     }
 }
 
+fn kill_process(state: &Arc<AppState>, pid: u32) -> Result<(), String> {
+    // Refuse to kill system/kernel processes
+    if pid < 1000 {
+        return Err(format!("PID {} is protected (system process)", pid));
+    }
+
+    let mut sys = state.sys.lock().unwrap();
+    sys.refresh_processes();
+
+    let sysinfo_pid = sysinfo::Pid::from(pid as usize);
+    match sys.process(sysinfo_pid) {
+        Some(process) => {
+            tracing::warn!(
+                "Killing process: {} (PID {})",
+                process.name(),
+                pid
+            );
+            process.kill();
+            Ok(())
+        }
+        None => Err(format!("PID {} not found", pid)),
+    }
+}
+
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 
 async fn auth_middleware(
@@ -400,7 +424,7 @@ fn build_temperature_info() -> Vec<TemperatureInfo> {
 fn build_gpu_info(nvml: &Option<nvml_wrapper::Nvml>) -> Vec<GpuInfo> {
     let mut gpus = Vec::new();
 
-    // NVIDIA GPUs via NVML
+    // NVIDIA GPUs via NVML (cross-platform)
     if let Some(nvml) = nvml {
         gpus.extend(collect_nvidia_gpus(nvml));
     }
@@ -409,6 +433,12 @@ fn build_gpu_info(nvml: &Option<nvml_wrapper::Nvml>) -> Vec<GpuInfo> {
     #[cfg(target_os = "linux")]
     {
         gpus.extend(collect_sysfs_gpus(gpus.len() as u32));
+    }
+
+    // AMD + Intel GPUs via WMI (Windows only)
+    #[cfg(target_os = "windows")]
+    {
+        gpus.extend(collect_wmi_gpus(gpus.len() as u32));
     }
 
     gpus
@@ -615,6 +645,75 @@ fn sysfs_read_u64(path: &std::path::Path) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+#[cfg(target_os = "windows")]
+fn collect_wmi_gpus(start_idx: u32) -> Vec<GpuInfo> {
+    use serde::Deserialize;
+    use wmi::{COMLibrary, WMIConnection};
+
+    #[derive(Deserialize)]
+    #[allow(non_snake_case)]
+    struct Win32VideoController {
+        Name: String,
+        AdapterCompatibility: Option<String>,
+        AdapterRAM: Option<u32>,
+    }
+
+    let com_lib = match COMLibrary::new() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("WMI COMLibrary init failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let wmi_con = match WMIConnection::new(com_lib) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("WMI connection failed: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let controllers: Vec<Win32VideoController> = match wmi_con.query() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("WMI query failed: {}", e);
+            return Vec::new();
+        }
+    };
+
+    controllers
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let compat = c.AdapterCompatibility.as_deref().unwrap_or("").to_lowercase();
+            let vendor = if compat.contains("intel") {
+                "Intel"
+            } else if compat.contains("amd") || compat.contains("advanced micro") {
+                "AMD"
+            } else {
+                return None; // skip NVIDIA (handled by NVML) and unknowns
+            };
+
+            // AdapterRAM is a u32 in WMI — capped at ~4 GB for older drivers.
+            let mem_mb = c.AdapterRAM.map(|b| b as u64 / 1_048_576).unwrap_or(0);
+
+            Some(GpuInfo {
+                index: start_idx + i as u32,
+                name: c.Name,
+                vendor: vendor.to_string(),
+                temperature_celsius: None,
+                utilization_percent: None,
+                memory_total_mb: mem_mb,
+                memory_used_mb: 0,
+                memory_usage_percent: 0.0,
+                fan_speed_percent: None,
+                power_draw_watts: None,
+                clock_speed_mhz: None,
+            })
+        })
+        .collect()
 }
 
 // ─── Disk & Network Builders ─────────────────────────────────────────────────
