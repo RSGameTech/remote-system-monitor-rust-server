@@ -48,6 +48,7 @@ struct MetricsResponse {
     gpu: Vec<GpuInfo>,
     disk: Vec<DiskInfo>,
     network: NetworkInfo,
+    temperatures: Vec<TemperatureInfo>,
 }
 
 #[derive(Serialize)]
@@ -126,6 +127,37 @@ struct HealthResponse {
     version: &'static str,
 }
 
+#[derive(Serialize)]
+struct TemperatureInfo {
+    /// Sensor label e.g. "CPU Package", "NVMe SSD", "acpitz"
+    component: String,
+    /// Current temperature in °C
+    temperature_celsius: f32,
+    /// Maximum recorded temperature in °C (if available)
+    max_celsius: Option<f32>,
+    /// Critical threshold in °C (if available)
+    critical_celsius: Option<f32>,
+}
+
+/// Inbound messages from the Android client
+#[derive(serde::Deserialize, Debug)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum ClientMessage {
+    SetInterval { ms: u64 },
+    KillProcess { pid: u32 },
+    Ping,
+}
+
+/// Outbound messages from the server to the Android client
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum ServerMessage {
+    Metrics { data: MetricsResponse },
+    KillResult { pid: u32, success: bool, error: Option<String> },
+    Pong,
+    Error { message: String },
+}
+
 // ─── Metric Helpers ───────────────────────────────────────────────────────────
 
 fn bytes_to_gb(bytes: u64) -> f64 {
@@ -148,6 +180,19 @@ fn uptime_string(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     format!("{}h {}m", h, m)
+}
+
+const ALLOWED_INTERVALS: &[u64] = &[250, 500, 1000, 2000, 5000];
+
+fn validate_interval(ms: u64) -> Result<u64, String> {
+    if ALLOWED_INTERVALS.contains(&ms) {
+        Ok(ms)
+    } else {
+        Err(format!(
+            "Invalid interval {}ms. Allowed: 250, 500, 1000, 2000, 5000",
+            ms
+        ))
+    }
 }
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
@@ -187,7 +232,7 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse> {
+async fn collect_full_metrics(state: &Arc<AppState>) -> MetricsResponse {
     let mut sys = state.sys.lock().unwrap();
     sys.refresh_specifics(
         RefreshKind::new()
@@ -208,7 +253,7 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse
     let network_info = build_network_info(&networks, &mut state.prev_net.lock().unwrap());
     let system_info = build_system_info(&sys);
 
-    Json(MetricsResponse {
+    MetricsResponse {
         timestamp: Local::now().to_rfc3339(),
         system: system_info,
         cpu: cpu_info,
@@ -216,7 +261,12 @@ async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse
         gpu: gpu_info,
         disk: disk_info,
         network: network_info,
-    })
+        temperatures: build_temperature_info(),
+    }
+}
+
+async fn get_metrics(State(state): State<Arc<AppState>>) -> Json<MetricsResponse> {
+    Json(collect_full_metrics(&state).await)
 }
 
 async fn get_cpu(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -329,6 +379,20 @@ fn build_memory_info(sys: &System) -> MemoryInfo {
         swap_used_gb: round2(bytes_to_gb(swap_used)),
         swap_percent: round1_f32(swap_percent),
     }
+}
+
+fn build_temperature_info() -> Vec<TemperatureInfo> {
+    let components = sysinfo::Components::new_with_refreshed_list();
+    components
+        .list()
+        .iter()
+        .map(|c| TemperatureInfo {
+            component: c.label().to_string(),
+            temperature_celsius: c.temperature(),
+            max_celsius: Some(c.max()).filter(|v| v.is_finite() && *v > 0.0),
+            critical_celsius: c.critical(),
+        })
+        .collect()
 }
 
 // ─── GPU Support ──────────────────────────────────────────────────────────────
